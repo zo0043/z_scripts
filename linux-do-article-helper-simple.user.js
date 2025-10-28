@@ -1558,33 +1558,29 @@
 
     // ==================== 快捷键管理器 ====================
     const KeyboardManager = {
-        // 快捷键配置
+        // 快捷键配置（简化版）
         shortcuts: {
             'toggleScroll': {
                 key: 'e',
                 ctrl: true,
-                shift: true,
                 description: '开启/关闭自动滚动',
                 action: () => TopicScroller.toggleAutoScroll()
             },
             'pauseResume': {
                 key: 's',
                 ctrl: true,
-                shift: true,
                 description: '暂停/恢复自动滚动',
                 action: () => TopicScroller.togglePause()
             },
             'scrollToTop': {
                 key: 'r',
                 ctrl: true,
-                shift: true,
                 description: '回到顶部',
                 action: () => TopicScroller.scrollToTop()
             },
             'scrollToBottom': {
                 key: 'b',
                 ctrl: true,
-                shift: true,
                 description: '滚动到底部',
                 action: () => TopicScroller.scrollToBottom()
             }
@@ -1786,10 +1782,10 @@
                         <div class="linux-do-helper-form-group">
                             <label class="linux-do-helper-label">⌨️ 快捷键：</label>
                             <div style="font-size: 11px; color: #666; line-height: 1.6;">
-                                <div>• <strong>Ctrl+Shift+E</strong>：开启/关闭自动滚动</div>
-                                <div>• <strong>Ctrl+Shift+S</strong>：暂停/恢复自动滚动</div>
-                                <div>• <strong>Ctrl+Shift+R</strong>：回到顶部</div>
-                                <div>• <strong>Ctrl+Shift+B</strong>：滚动到底部</div>
+                                <div>• <strong>Ctrl+E</strong>：开启/关闭自动滚动</div>
+                                <div>• <strong>Ctrl+S</strong>：暂停/恢复自动滚动</div>
+                                <div>• <strong>Ctrl+R</strong>：回到顶部</div>
+                                <div>• <strong>Ctrl+B</strong>：滚动到底部</div>
                             </div>
                         </div>
                     </div>
