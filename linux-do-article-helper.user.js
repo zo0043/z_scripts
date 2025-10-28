@@ -1327,7 +1327,6 @@
                 const topics = DataFetcher.fetchViaDOM(); // 使用DOM解析获取当前页面文章
 
                 // 调试信息：打印获取到的文章数量和标题
-                console.log('Linux.do助手: 检查新文章 - 获取到', topics.length, '篇文章');
                 console.log('Linux.do助手: 当前关键词:', config.keywords);
                 console.log('Linux.do助手: 匹配模式:', config.matchMode);
                 console.log('Linux.do助手: 自动打开功能:', config.autoOpenInScroll);
