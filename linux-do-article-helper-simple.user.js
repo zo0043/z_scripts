@@ -359,9 +359,26 @@
 
     // ==================== 帖子滚动管理器 ====================
     const TopicScroller = {
+        // 滚动状态枚举（实用版）
+        ScrollState: {
+            STOPPED: 'stopped',           // 停止状态
+            SCROLLING: 'scrolling',       // 自动滚动中
+            PAUSED: 'paused',             // 用户暂停
+            ERROR: 'error'                // 错误状态
+        },
+
+        // 状态机相关变量
+        currentScrollState: 'stopped',   // 当前滚动状态
+        lastScrollDirection: null,       // 上次滚动方向
+        stateTransitionLocked: false,    // 状态转换锁定（防止快速重复转换）
+        lastStateTransitionTime: 0,      // 上次状态转换时间
+        pendingTransition: null,         // 待处理的状态转换
+        transitionLockTimer: null,       // 转换锁定定时器
+        stateHistory: [],                // 状态转换历史记录（用于调试）
+        lastProcessTime: 0,             // 上次处理滚动事件的时间（用于节流）
+
         // 用户滚动行为检测相关变量
         lastScrollTop: 0,
-        isPausedByUser: false,
         userScrollBound: false,
 
         // 防抖相关变量
@@ -376,85 +393,538 @@
             return Math.floor(Math.random() * (maxDelay - minDelay + 1)) + minDelay;
         },
 
-        // 开始自动滚动
-        startAutoScroll() {
-            if (AppState.isTopicScrolling) return;
+        // ===== 状态机核心方法 =====
 
-            const config = AppState.config;
-            AppState.isTopicScrolling = true;
+        // 检查是否可以转换到目标状态
+        canTransitionTo(newState) {
+            const currentState = this.currentScrollState;
+            const now = Date.now();
+            const timeSinceLastTransition = now - this.lastStateTransitionTime;
 
-            // 添加用户滚动事件监听
-            this.bindUserScrollEvents();
+            // 防止快速重复转换（至少间隔100ms）
+            if (timeSinceLastTransition < 100 && this.stateTransitionLocked) {
+                return false;
+            }
 
-            // 使用递归setTimeout实现随机间隔滚动
-            const scheduleNextScroll = () => {
-                if (!AppState.isTopicScrolling) return;
-
-                const delay = this.getRandomDelay();
-                AppState.topicScrollTimer = setTimeout(() => {
-                    if (AppState.isTopicScrolling) {
-                        this.scrollStep();
-                        scheduleNextScroll(); // 递归调度下一次滚动
-                    }
-                }, delay);
+            // 定义允许的状态转换规则（实用版）
+            const allowedTransitions = {
+                [this.ScrollState.STOPPED]: [this.ScrollState.SCROLLING, this.ScrollState.ERROR],
+                [this.ScrollState.SCROLLING]: [this.ScrollState.PAUSED, this.ScrollState.STOPPED, this.ScrollState.ERROR],
+                [this.ScrollState.PAUSED]: [this.ScrollState.SCROLLING, this.ScrollState.STOPPED, this.ScrollState.ERROR],
+                [this.ScrollState.ERROR]: [this.ScrollState.STOPPED, this.ScrollState.SCROLLING] // 允许从错误状态恢复
             };
 
-            // 开始第一次滚动
-            this.scrollStep();
-            scheduleNextScroll();
-
-            TabManager.showNotification('帖子自动滚动已启动');
+            return allowedTransitions[currentState]?.includes(newState) || false;
         },
 
-        // 停止自动滚动
-        stopAutoScroll() {
-            if (!AppState.isTopicScrolling) return;
+        // 队列化状态转换请求（解决竞态条件）
+        queueTransition(newState, context) {
+            this.pendingTransition = { newState, context, timestamp: Date.now() };
+            console.log('状态转换已排队:', this.pendingTransition);
+            return false;
+        },
 
-            AppState.isTopicScrolling = false;
+        // 处理待处理的转换请求
+        processPendingTransition() {
+            if (this.pendingTransition && !this.stateTransitionLocked) {
+                const { newState, context } = this.pendingTransition;
+                this.pendingTransition = null;
+                return this.executeTransition(newState, context);
+            }
+            return false;
+        },
 
-            // 清理定时器
-            if (AppState.topicScrollTimer) {
+        // 执行状态转换的核心逻辑
+        executeTransition(newState, context = {}) {
+            const oldState = this.currentScrollState;
+
+            try {
+                // 记录状态转换历史
+                this.recordStateTransition(oldState, newState, context);
+
+                // 执行状态转换
+                this.currentScrollState = newState;
+                this.lastStateTransitionTime = Date.now();
+
+                // 设置转换锁定
+                this.setStateTransitionLocked(true);
+
+                // 异步触发状态进入时的副作用（避免阻塞）
+                this.onStateEnterAsync(newState, oldState, context)
+                    .catch(error => {
+                        console.error('状态进入副作用执行失败:', error);
+                        this.handleStateError(error, newState, oldState);
+                    });
+
+                console.log(`滚动状态转换: ${oldState} -> ${newState}`, context);
+                return true;
+
+            } catch (error) {
+                console.error('状态转换执行失败:', error);
+                this.handleStateError(error, newState, oldState);
+                return false;
+            }
+        },
+
+        // 改进的状态转换核心方法
+        transitionScrollState(newState, context = {}) {
+            // 验证输入
+            if (!newState || typeof newState !== 'string') {
+                console.error('无效的状态转换目标:', newState);
+                return false;
+            }
+
+            // 检查是否可以转换
+            if (!this.canTransitionTo(newState)) {
+                // 如果当前锁定，将转换请求排队
+                if (this.stateTransitionLocked) {
+                    return this.queueTransition(newState, context);
+                }
+                console.warn(`不允许的状态转换: ${this.currentScrollState} -> ${newState}`);
+                return false;
+            }
+
+            return this.executeTransition(newState, context);
+        },
+
+        // 设置状态转换锁定
+        setStateTransitionLocked(locked) {
+            this.stateTransitionLocked = locked;
+
+            if (locked) {
+                // 清理之前的定时器
+                if (this.transitionLockTimer) {
+                    clearTimeout(this.transitionLockTimer);
+                }
+
+                // 设置新的锁定定时器
+                this.transitionLockTimer = setTimeout(() => {
+                    this.stateTransitionLocked = false;
+                    this.transitionLockTimer = null;
+
+                    // 处理待处理的转换请求
+                    this.processPendingTransition();
+                }, 150);
+            } else {
+                // 如果手动解锁，清理定时器
+                if (this.transitionLockTimer) {
+                    clearTimeout(this.transitionLockTimer);
+                    this.transitionLockTimer = null;
+                }
+            }
+        },
+
+        // 记录状态转换历史
+        recordStateTransition(from, to, context) {
+            const record = {
+                from,
+                to,
+                context: { ...context },
+                timestamp: Date.now()
+            };
+
+            this.stateHistory.push(record);
+
+            // 保持最近50条记录
+            if (this.stateHistory.length > 50) {
+                this.stateHistory.shift();
+            }
+        },
+
+        // 异步状态进入时的副作用处理（带异常保护）
+        async onStateEnterAsync(newState, oldState, context = {}) {
+            try {
+                await this.onStateEnter(newState, oldState, context);
+            } catch (error) {
+                console.error('状态进入副作用异步执行失败:', error);
+                throw error; // 重新抛出，让上层处理
+            }
+        },
+
+        // 状态进入时的副作用处理（优化异步操作）
+        onStateEnter(newState, oldState, context = {}) {
+            const { reason, direction } = context;
+
+            try {
+                switch (newState) {
+                    case this.ScrollState.SCROLLING:
+                        if (oldState === this.ScrollState.PAUSED && direction === 'down') {
+                            TabManager.showNotification('向下滚动，自动滚动已恢复', 'resume');
+
+                            // 恢复滚动时，延迟触发一次滚动检查（避免时序问题）
+                            setTimeout(() => {
+                                // 双重检查：确保状态仍然有效且 AppState 同步
+                                if (this.currentScrollState === this.ScrollState.SCROLLING &&
+                                    AppState.isTopicScrolling) {
+                                    this.scrollStep();
+                                }
+                            }, 150); // 增加延迟确保状态稳定
+                        }
+                        break;
+
+                    case this.ScrollState.PAUSED:
+                        if (direction === 'up') {
+                            TabManager.showNotification('向上滚动，自动滚动已暂停', 'pause');
+                        }
+                        break;
+
+                    case this.ScrollState.STOPPED:
+                        // 停止状态的副作用已在外部处理
+                        break;
+
+                    case this.ScrollState.ERROR:
+                        TabManager.showNotification('自动滚动遇到错误，已重置', 'error');
+                        break;
+                }
+
+                // 更新UI状态显示（带异常保护）
+                try {
+                    this.updateTopicScrollStatusThrottled();
+                } catch (uiError) {
+                    console.warn('UI状态更新失败:', uiError);
+                }
+
+            } catch (error) {
+                console.error('状态进入副作用执行失败:', error);
+                throw error; // 重新抛出，让异步处理器捕获
+            }
+        },
+
+        // 状态错误处理机制
+        handleStateError(error, newState, oldState) {
+            console.error('状态机错误:', {
+                error: error.message,
+                newState,
+                oldState,
+                currentState: this.currentScrollState,
+                timestamp: Date.now()
+            });
+
+            // 尝试恢复到安全状态
+            try {
+                // 如果错误发生在状态转换过程中，尝试回滚到之前的状态
+                if (this.currentScrollState === newState) {
+                    this.currentScrollState = oldState;
+                    console.log('已回滚到安全状态:', oldState);
+                }
+
+                // 重置锁定状态
+                this.setStateTransitionLocked(false);
+
+                // 清理待处理的转换
+                this.pendingTransition = null;
+
+                // 通知用户（如果需要）
+                TabManager.showNotification('自动滚动遇到错误，已重置', 'error');
+
+            } catch (recoveryError) {
+                console.error('错误恢复失败:', recoveryError);
+                // 最后的安全措施：强制重置所有状态
+                this.forceReset();
+            }
+        },
+
+        // 强制重置状态机（最后的安全措施）
+        forceReset() {
+            console.warn('强制重置状态机');
+
+            try {
+                // 使用统一的清理方法
+                this.clearAllTimers();
+
+                // 清理AppState定时器
+                if (AppState.topicScrollTimer) {
+                    clearTimeout(AppState.topicScrollTimer);
+                    AppState.topicScrollTimer = null;
+                }
+
+                // 重置所有状态变量
+                this.currentScrollState = this.ScrollState.STOPPED;
+                this.lastScrollDirection = null;
+                this.stateTransitionLocked = false;
+                this.lastStateTransitionTime = Date.now();
+                this.pendingTransition = null;
+                this.lastProcessTime = 0;
+
+                // 强制同步AppState状态
+                AppState.isTopicScrolling = false;
+
+                // 移除事件监听器
+                this.unbindUserScrollEvents();
+
+                // 记录强制重置事件
+                this.recordStateTransition('UNKNOWN', this.ScrollState.STOPPED, {
+                    reason: 'force_reset',
+                    error: '状态机强制重置',
+                    timestamp: Date.now()
+                });
+
+                console.log('状态机已强制重置到安全状态');
+
+            } catch (error) {
+                console.error('强制重置失败:', error);
+                // 最后的最后：直接设置状态变量，不依赖任何方法
+                try {
+                    this.currentScrollState = this.ScrollState.STOPPED;
+                    AppState.isTopicScrolling = false;
+                } catch (fatalError) {
+                    console.error('致命错误：无法重置状态:', fatalError);
+                }
+            }
+        },
+
+        // 状态验证方法
+        validateState() {
+            const validStates = Object.values(this.ScrollState);
+
+            if (!validStates.includes(this.currentScrollState)) {
+                throw new Error(`无效的当前状态: ${this.currentScrollState}`);
+            }
+
+            // 检查AppState和状态机的一致性（以状态机为权威）
+            const shouldBeScrolling = this.currentScrollState === this.ScrollState.SCROLLING;
+
+            if (AppState.isTopicScrolling !== shouldBeScrolling) {
+                console.warn(`状态不一致: AppState.isTopicScrolling=${AppState.isTopicScrolling} 但状态机=${this.currentScrollState}`);
+                // 以状态机为准，自动修复AppState
+                AppState.isTopicScrolling = shouldBeScrolling;
+                console.log(`已自动修复AppState状态为: ${shouldBeScrolling}`);
+            }
+
+            // 检查定时器状态一致性（仅在应该滚动时检查）
+            if (shouldBeScrolling && !AppState.topicScrollTimer) {
+                console.warn('警告: 应该滚动但没有topicScrollTimer');
+            }
+
+            if (!shouldBeScrolling && AppState.topicScrollTimer) {
+                console.warn('警告: 不应该滚动但存在topicScrollTimer，正在清理');
                 clearTimeout(AppState.topicScrollTimer);
                 AppState.topicScrollTimer = null;
             }
 
-            // 移除用户滚动事件监听
-            this.unbindUserScrollEvents();
+            return true;
+        },
 
-            // 清理防抖定时器
-            if (this.scrollDebounceTimer) {
-                clearTimeout(this.scrollDebounceTimer);
-                this.scrollDebounceTimer = null;
+        // 统一的滚动事件处理方法（完善的状态转换逻辑）
+        handleUserScrollEvent(direction) {
+            // 更新上次滚动方向
+            if (this.lastScrollDirection !== direction) {
+                this.lastScrollDirection = direction;
             }
 
-            // 清理状态更新定时器
-            if (this.statusUpdateTimer) {
-                clearTimeout(this.statusUpdateTimer);
-                this.statusUpdateTimer = null;
+            const currentState = this.currentScrollState;
+
+            // 状态转换逻辑矩阵
+            switch (currentState) {
+                case this.ScrollState.SCROLLING:
+                    if (direction === 'up') {
+                        // 向上滚动：从滚动状态转到暂停状态
+                        this.transitionScrollState(this.ScrollState.PAUSED, {
+                            reason: 'user_scroll_up',
+                            direction: 'up'
+                        });
+                    }
+                    // direction === 'down' 时保持滚动状态，无需转换
+                    break;
+
+                case this.ScrollState.PAUSED:
+                    if (direction === 'down') {
+                        // 向下滚动：从暂停状态恢复到滚动状态
+                        this.transitionScrollState(this.ScrollState.SCROLLING, {
+                            reason: 'user_scroll_down',
+                            direction: 'down'
+                        });
+                    }
+                    // direction === 'up' 时保持暂停状态，无需转换
+                    break;
+
+                case this.ScrollState.STOPPED:
+                    // 停止状态下，任何用户滚动都不应该触发状态转换
+                    console.log('当前状态为STOPPED，忽略用户滚动事件');
+                    break;
+
+                case this.ScrollState.ERROR:
+                    // 错误状态下，尝试恢复到正常状态
+                    console.log('当前状态为ERROR，尝试恢复');
+                    this.transitionScrollState(this.ScrollState.STOPPED, {
+                        reason: 'error_recovery',
+                        direction: direction
+                    });
+                    break;
+
+                default:
+                    console.warn(`未知状态: ${currentState}`);
+                    break;
+            }
+        },
+
+        // 开始自动滚动（重构为单一状态源）
+        startAutoScroll() {
+            // 直接使用状态机状态作为唯一状态源
+            if (this.currentScrollState === this.ScrollState.SCROLLING) {
+                console.warn('自动滚动已在运行中');
+                return;
             }
 
-            // 重置用户滚动状态
-            this.isPausedByUser = false;
-            this.lastScrollTop = 0;
+            try {
+                const config = AppState.config;
 
-            TabManager.showNotification('帖子自动滚动已停止');
+                // 先进行状态转换
+                const transitionSuccess = this.transitionScrollState(this.ScrollState.SCROLLING, {
+                    reason: 'user_start'
+                });
+
+                if (!transitionSuccess) {
+                    console.error('启动自动滚动失败：状态转换失败');
+                    return;
+                }
+
+                // 状态转换成功后，同步更新AppState（作为备份状态）
+                AppState.isTopicScrolling = true;
+                console.log('自动滚动已启动');
+
+                // 添加用户滚动事件监听
+                this.bindUserScrollEvents();
+
+                              // 使用优化的递归调度实现随机间隔滚动（防止内存泄漏）
+                const scheduleNextScroll = (iterationCount = 0) => {
+                    // 防止无限递归的安全措施
+                    if (iterationCount > 10000) { // 限制最大迭代次数
+                        console.warn('递归调度次数过多，停止自动滚动');
+                        this.stopAutoScroll();
+                        return;
+                    }
+
+                    // 使用状态机状态作为唯一判断标准
+                    if (this.currentScrollState !== this.ScrollState.SCROLLING) {
+                        console.log(`递归调度停止，当前状态: ${this.currentScrollState}`);
+                        return;
+                    }
+
+                    const delay = this.getRandomDelay();
+                    AppState.topicScrollTimer = setTimeout(() => {
+                        // 再次检查状态机状态
+                        if (this.currentScrollState === this.ScrollState.SCROLLING) {
+                            try {
+                                this.scrollStep();
+                                scheduleNextScroll(iterationCount + 1); // 递归调度下一次滚动
+                            } catch (error) {
+                                console.error('滚动步骤执行失败:', error);
+                                // 出错时停止自动滚动，防止无限错误循环
+                                this.stopAutoScroll();
+                            }
+                        } else {
+                            console.log(`setTimeout回调停止，当前状态: ${this.currentScrollState}`);
+                        }
+                    }, delay);
+                };
+
+                // 开始第一次滚动
+                this.scrollStep();
+                scheduleNextScroll();
+
+                TabManager.showNotification('帖子自动滚动已启动');
+
+            } catch (error) {
+                console.error('启动自动滚动时发生错误:', error);
+                // 确保状态一致性
+                AppState.isTopicScrolling = false;
+                this.currentScrollState = this.ScrollState.STOPPED;
+            }
+        },
+
+        // 停止自动滚动（重构为单一状态源）
+        stopAutoScroll() {
+            // 直接使用状态机状态作为唯一状态源
+            if (this.currentScrollState === this.ScrollState.STOPPED) {
+                console.warn('自动滚动未在运行中');
+                return;
+            }
+
+            try {
+                // 先进行状态转换
+                const transitionSuccess = this.transitionScrollState(this.ScrollState.STOPPED, {
+                    reason: 'user_stop'
+                });
+
+                if (!transitionSuccess) {
+                    console.error('停止自动滚动失败：状态转换失败');
+                    return;
+                }
+
+                // 状态转换成功后，同步更新AppState
+                AppState.isTopicScrolling = false;
+                console.log('自动滚动已停止');
+
+                // 清理定时器
+                if (AppState.topicScrollTimer) {
+                    clearTimeout(AppState.topicScrollTimer);
+                    AppState.topicScrollTimer = null;
+                }
+
+                // 移除用户滚动事件监听
+                this.unbindUserScrollEvents();
+
+                // 清理防抖定时器
+                if (this.scrollDebounceTimer) {
+                    clearTimeout(this.scrollDebounceTimer);
+                    this.scrollDebounceTimer = null;
+                }
+
+                // 清理状态更新定时器
+                if (this.statusUpdateTimer) {
+                    clearTimeout(this.statusUpdateTimer);
+                    this.statusUpdateTimer = null;
+                }
+
+                // 重置其他状态
+                this.lastScrollTop = 0;
+
+                TabManager.showNotification('帖子自动滚动已停止');
+
+            } catch (error) {
+                console.error('停止自动滚动时发生错误:', error);
+                // 强制确保状态一致性
+                AppState.isTopicScrolling = false;
+                this.currentScrollState = this.ScrollState.STOPPED;
+                this.forceReset();
+            }
         },
 
         // 滚动一步
         scrollStep() {
             const config = AppState.config;
 
-            // 检查用户是否暂停了滚动 - 如果暂停，直接返回，不继续调度
-            if (this.isPausedByUser) {
-                return; // 简化：暂停时直接返回，由外部事件触发恢复
+            // 使用状态机状态作为唯一判断标准
+            const currentState = this.currentScrollState;
+
+            // 只有在SCROLLING状态才继续执行
+            if (currentState !== this.ScrollState.SCROLLING) {
+                console.log(`滚动步骤被跳过，当前状态: ${currentState}`);
+                return;
             }
 
             // 更精确的底部检测
             const isAtBottom = this.isAtBottom();
 
             if (isAtBottom) {
-                // 到达底部，停止滚动
-                this.stopAutoScroll();
+                // 到达底部，先转换状态再停止滚动
+                const transitionSuccess = this.transitionScrollState(this.ScrollState.STOPPED, {
+                    reason: 'reached_bottom'
+                });
+
+                if (transitionSuccess) {
+                    // 只有状态转换成功才更新AppState
+                    AppState.isTopicScrolling = false;
+                    if (AppState.topicScrollTimer) {
+                        clearTimeout(AppState.topicScrollTimer);
+                        AppState.topicScrollTimer = null;
+                    }
+                } else {
+                    console.error('到底部停止失败：状态转换失败');
+                    return;
+                }
+
                 TabManager.showNotification('已滚动到底部，自动停止');
 
                 // 可选：回到顶部继续滚动
@@ -525,7 +995,7 @@
             });
         },
 
-        // 绑定用户滚动事件监听
+        // 绑定用户滚动事件监听（重构为统一事件处理）
         bindUserScrollEvents() {
             // 避免重复绑定（双重检查）
             if (this.userScrollBound) return;
@@ -535,104 +1005,86 @@
 
             // 初始化当前滚动位置
             this.lastScrollTop = window.pageYOffset || document.documentElement.scrollTop;
+            this.lastProcessTime = 0; // 初始化事件处理时间戳
 
             try {
-                // 绑定滚动事件
-                this.handleUserScroll = (e) => this.onUserScroll(e);
-                window.addEventListener('scroll', this.handleUserScroll, { passive: true });
+                // 统一的滚动事件处理器
+                this.handleUnifiedScroll = (e) => this.onUnifiedScroll(e);
 
-                // 绑定鼠标滚轮事件（更精确的检测）
-                this.handleWheel = (e) => this.onUserWheel(e);
-                window.addEventListener('wheel', this.handleWheel, { passive: true });
+                // 只绑定scroll事件，wheel事件通过scroll事件统一处理
+                window.addEventListener('scroll', this.handleUnifiedScroll, { passive: true });
 
                 this.userScrollBound = true;
+                console.log('滚动事件监听已绑定');
             } catch (error) {
                 console.error('Linux.do助手: 滚动事件绑定失败', error);
                 this.userScrollBound = false;
             }
         },
 
-        // 移除用户滚动事件监听
+        // 移除用户滚动事件监听（重构为统一事件处理）
         unbindUserScrollEvents() {
             if (!this.userScrollBound) return;
 
             try {
-                // 安全移除事件监听器
-                if (this.handleUserScroll) {
-                    window.removeEventListener('scroll', this.handleUserScroll);
-                    this.handleUserScroll = null;
-                }
-
-                if (this.handleWheel) {
-                    window.removeEventListener('wheel', this.handleWheel);
-                    this.handleWheel = null;
+                // 安全移除统一事件监听器
+                if (this.handleUnifiedScroll) {
+                    window.removeEventListener('scroll', this.handleUnifiedScroll);
+                    this.handleUnifiedScroll = null;
                 }
 
                 this.userScrollBound = false;
+                console.log('滚动事件监听已解绑');
             } catch (error) {
                 console.error('Linux.do助手: 滚动事件解绑失败', error);
             }
         },
 
-        // 统一的滚动方向处理逻辑（带防抖）
+        // 已废弃：使用新的状态机方法 handleUserScrollEvent 替代
+        // 保留此方法以防其他地方有引用
         handleScrollDirection(scrollDirection) {
-            let stateChanged = false;
-            let notificationMessage = '';
-            let notificationType = 'default';
-
-            if (scrollDirection === 'up' && !this.isPausedByUser) {
-                this.isPausedByUser = true;
-                stateChanged = true;
-                notificationMessage = '向上滚动，自动滚动已暂停';
-                notificationType = 'pause';
-            } else if (scrollDirection === 'down' && this.isPausedByUser) {
-                this.isPausedByUser = false;
-                stateChanged = true;
-                notificationMessage = '向下滚动，自动滚动已恢复';
-                notificationType = 'resume';
-
-                // 恢复滚动时，立即触发一次滚动检查
-                setTimeout(() => {
-                    if (AppState.isTopicScrolling && !this.isPausedByUser) {
-                        this.scrollStep();
-                    }
-                }, 100);
-            }
-
-            // 显示通知（仅在状态改变时）
-            if (stateChanged) {
-                TabManager.showNotification(notificationMessage, notificationType);
-            }
-
-            // 节流更新UI状态显示
-            this.updateTopicScrollStatusThrottled();
+            console.warn('handleScrollDirection 方法已废弃，请使用 handleUserScrollEvent');
+            this.handleUserScrollEvent(scrollDirection);
         },
 
-        // 处理用户滚动事件（带防抖）
-        onUserScroll(e) {
-            // 防抖处理
+        // 统一的滚动事件处理器（防抖+节流）
+        onUnifiedScroll(e) {
+            const now = Date.now();
+
+            // 节流处理：限制处理频率（50ms内只处理一次）
+            if (this.lastProcessTime && (now - this.lastProcessTime < 50)) {
+                return;
+            }
+
+            // 清理之前的防抖定时器
             if (this.scrollDebounceTimer) {
                 clearTimeout(this.scrollDebounceTimer);
             }
 
             this.scrollDebounceTimer = setTimeout(() => {
                 const currentScrollTop = window.pageYOffset || document.documentElement.scrollTop;
+
+                // 检测滚动方向（设置最小阈值避免微小滚动）
+                const scrollDelta = Math.abs(currentScrollTop - this.lastScrollTop);
+                if (scrollDelta < 20) { // 提高阈值到20px，减少触发频率
+                    return;
+                }
+
                 const scrollDirection = currentScrollTop > this.lastScrollTop ? 'down' : 'up';
 
-                this.handleScrollDirection(scrollDirection);
+                // 更新处理时间戳
+                this.lastProcessTime = Date.now();
+
+                // 使用状态机方法处理
+                this.handleUserScrollEvent(scrollDirection);
 
                 // 更新上次滚动位置
                 this.lastScrollTop = currentScrollTop;
-            }, 50); // 50ms防抖
+
+            }, 30); // 减少防抖时间到30ms，配合节流使用
         },
 
-        // 处理用户鼠标滚轮事件（直接处理，无防抖）
-        onUserWheel(e) {
-            const wheelDirection = e.deltaY > 0 ? 'down' : 'up';
-            this.handleScrollDirection(wheelDirection);
-        },
-
-        // 节流的状态更新方法
+        // 节流的状态更新方法（优化版）
         updateTopicScrollStatusThrottled() {
             if (this.statusUpdateTimer) return;
 
@@ -641,7 +1093,131 @@
                     ControlPanel.updateTopicScrollStatus();
                 }
                 this.statusUpdateTimer = null;
-            }, 100);
+            }, 50); // 减少到50ms，提高响应速度
+        },
+
+        // 获取当前状态的描述文本
+        getStateDescription() {
+            switch (this.currentScrollState) {
+                case this.ScrollState.STOPPED:
+                    return '已停止';
+                case this.ScrollState.SCROLLING:
+                    return '滚动中';
+                case this.ScrollState.PAUSED:
+                    return '已暂停';
+                case this.ScrollState.ERROR:
+                    return '错误状态';
+                default:
+                    return '未知状态';
+            }
+        },
+
+        // 检查当前是否为暂停状态
+        isPaused() {
+            return this.currentScrollState === this.ScrollState.PAUSED;
+        },
+
+        // 检查当前是否为滚动状态
+        isActive() {
+            return this.currentScrollState === this.ScrollState.SCROLLING;
+        },
+
+        // 初始化状态机（修复状态依赖问题）
+        initializeStateMachine() {
+            try {
+                // 清理所有可能存在的定时器
+                this.clearAllTimers();
+
+                // 重置所有状态变量
+                this.lastScrollDirection = null;
+                this.stateTransitionLocked = false;
+                this.lastStateTransitionTime = Date.now();
+                this.pendingTransition = null;
+                this.stateHistory = [];
+                this.lastProcessTime = 0;
+
+                // 设置状态机初始状态 - 不依赖AppState状态
+                this.currentScrollState = this.ScrollState.STOPPED;
+
+                // 强制同步AppState状态（避免依赖问题）
+                AppState.isTopicScrolling = false;
+                if (AppState.topicScrollTimer) {
+                    clearTimeout(AppState.topicScrollTimer);
+                    AppState.topicScrollTimer = null;
+                }
+
+                // 记录初始化事件
+                this.recordStateTransition('INIT', this.currentScrollState, {
+                    reason: 'initialization',
+                    note: '强制重置到STOPPED状态'
+                });
+
+                console.log('状态机初始化完成，当前状态:', this.currentScrollState);
+
+            } catch (error) {
+                console.error('状态机初始化失败:', error);
+                // 最后的安全措施
+                this.forceReset();
+            }
+        },
+
+        // 清理所有定时器
+        clearAllTimers() {
+            if (this.transitionLockTimer) {
+                clearTimeout(this.transitionLockTimer);
+                this.transitionLockTimer = null;
+            }
+            if (this.scrollDebounceTimer) {
+                clearTimeout(this.scrollDebounceTimer);
+                this.scrollDebounceTimer = null;
+            }
+            if (this.statusUpdateTimer) {
+                clearTimeout(this.statusUpdateTimer);
+                this.statusUpdateTimer = null;
+            }
+        },
+
+        // 调试方法：获取当前状态信息（开发时使用）
+        getDebugInfo() {
+            return {
+                currentState: this.currentScrollState,
+                lastDirection: this.lastScrollDirection,
+                isLocked: this.stateTransitionLocked,
+                timeSinceLastTransition: Date.now() - this.lastStateTransitionTime,
+                isTopicScrolling: AppState.isTopicScrolling,
+                hasPendingTransition: !!this.pendingTransition,
+                stateHistoryCount: this.stateHistory.length,
+                lastStateTransition: this.stateHistory[this.stateHistory.length - 1],
+                stateConsistency: this.checkStateConsistency()
+            };
+        },
+
+        // 检查状态一致性
+        checkStateConsistency() {
+            const issues = [];
+
+            // 检查AppState和状态机的一致性
+            if (AppState.isTopicScrolling && this.currentScrollState === this.ScrollState.STOPPED) {
+                issues.push('AppState.isTopicScrolling为true但状态机为STOPPED');
+            }
+
+            if (!AppState.isTopicScrolling && this.currentScrollState !== this.ScrollState.STOPPED) {
+                issues.push('AppState.isTopicScrolling为false但状态机不为STOPPED');
+            }
+
+            // 检查定时器状态一致性
+            if (AppState.isTopicScrolling && !AppState.topicScrollTimer) {
+                issues.push('AppState.isTopicScrolling为true但没有topicScrollTimer');
+            }
+
+            if (!AppState.isTopicScrolling && AppState.topicScrollTimer) {
+                issues.push('AppState.isTopicScrolling为false但存在topicScrollTimer');
+            }
+
+            return {
+                isConsistent: issues.length === 0,
+                issues
+            };
         },
 
         // 切换滚动状态
@@ -1118,6 +1694,9 @@
                 // 加载帖子页面配置
                 this.loadTopicConfig();
 
+                // 初始化状态机
+                TopicScroller.initializeStateMachine();
+
             } else if (this.currentPageType === 'list') {
                 // 列表页面的事件绑定
                 document.getElementById('refresh-btn')?.addEventListener('click', () => this.refreshTopics());
@@ -1260,19 +1839,25 @@
             const statusDiv = document.getElementById('status-display');
             if (!statusDiv) return;
 
-            // 更新滚动状态显示
-            const scrollStatusText = AppState.isTopicScrolling ?
-                (TopicScroller.isPausedByUser ? '已暂停' : '滚动中') : '已停止';
+            // 直接使用状态机获取当前状态描述
+            const scrollStatusText = TopicScroller.getStateDescription();
 
             const scrollStatusDiv = statusDiv.querySelector('div:nth-child(5)');
             if (scrollStatusDiv) {
                 scrollStatusDiv.textContent = `🔄 滚动状态：${scrollStatusText}`;
             }
 
-            // 更新用户滚动状态显示
+            // 更新用户滚动状态显示 - 基于新状态机
             const userScrollStatusDiv = statusDiv.querySelector('div:nth-child(6)');
             if (userScrollStatusDiv) {
-                const pauseStatus = TopicScroller.isPausedByUser ? '用户暂停⏸️' : '未检测';
+                let pauseStatus = '未检测';
+                if (AppState.isTopicScrolling) {
+                    if (TopicScroller.isPaused()) {
+                        pauseStatus = '用户暂停⏸️';
+                    } else if (TopicScroller.isActive()) {
+                        pauseStatus = '自动滚动中📜';
+                    }
+                }
                 userScrollStatusDiv.textContent = `👆 用户滚动：${pauseStatus}`;
             }
         },
