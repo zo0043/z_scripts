@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Linux.do 文章助手 (简化版)
+// @name         Linux.do 文章助手
 // @namespace    http://tampermonkey.net/
-// @version      2.6.0
-// @description  简化版Linux.do文章助手 - 关键词匹配、批量打开功能和即时响应的帖子页面自动滚动
+// @version      3.0.0
+// @description  Linux.do文章助手 - 关键词匹配、批量打开功能、智能自动滚动和快捷键控制
 // @author       AI Assistant
 // @match        https://linux.do/*
 // @grant        GM_openInTab
@@ -551,12 +551,14 @@
                         if (oldState === this.ScrollState.PAUSED && direction === 'down') {
                             TabManager.showNotification('向下滚动，自动滚动已恢复', 'resume');
 
-                            // 恢复滚动时，延迟触发一次滚动检查（避免时序问题）
+                            // 恢复滚动时，重新启动递归调度机制
                             setTimeout(() => {
-                                // 双重检查：确保状态仍然有效且 AppState 同步
+                                // 双重检查：确保状态仍然有效
                                 if (this.currentScrollState === this.ScrollState.SCROLLING &&
                                     AppState.isTopicScrolling) {
-                                    this.scrollStep();
+
+                                    // 重新启动递归调度
+                                    this.restartScrolling();
                                 }
                             }, 150); // 增加延迟确保状态稳定
                         }
@@ -565,6 +567,12 @@
                     case this.ScrollState.PAUSED:
                         if (direction === 'up') {
                             TabManager.showNotification('向上滚动，自动滚动已暂停', 'pause');
+
+                            // 确保AppState状态正确（暂停时仍然应该为true）
+                            if (!AppState.isTopicScrolling) {
+                                console.warn('修复AppState状态：暂停时isTopicScrolling应该为true');
+                                AppState.isTopicScrolling = true;
+                            }
                         }
                         break;
 
@@ -1177,6 +1185,61 @@
             }
         },
 
+        // 重新启动滚动调度（用于从暂停状态恢复）
+        restartScrolling() {
+            try {
+                console.log('重新启动滚动调度');
+
+                // 确保没有旧的定时器残留
+                if (AppState.topicScrollTimer) {
+                    clearTimeout(AppState.topicScrollTimer);
+                    AppState.topicScrollTimer = null;
+                }
+
+                // 使用与startAutoScroll相同的递归调度逻辑
+                const scheduleNextScroll = (iterationCount = 0) => {
+                    // 防止无限递归的安全措施
+                    if (iterationCount > 10000) {
+                        console.warn('递归调度次数过多，停止自动滚动');
+                        this.stopAutoScroll();
+                        return;
+                    }
+
+                    // 使用状态机状态作为唯一判断标准
+                    if (this.currentScrollState !== this.ScrollState.SCROLLING) {
+                        console.log(`重启调度停止，当前状态: ${this.currentScrollState}`);
+                        return;
+                    }
+
+                    const delay = this.getRandomDelay();
+                    AppState.topicScrollTimer = setTimeout(() => {
+                        // 再次检查状态机状态
+                        if (this.currentScrollState === this.ScrollState.SCROLLING) {
+                            try {
+                                this.scrollStep();
+                                scheduleNextScroll(iterationCount + 1); // 递归调度下一次滚动
+                            } catch (error) {
+                                console.error('重启滚动步骤执行失败:', error);
+                                this.stopAutoScroll();
+                            }
+                        } else {
+                            console.log(`重启setTimeout回调停止，当前状态: ${this.currentScrollState}`);
+                        }
+                    }, delay);
+                };
+
+                // 立即执行一次滚动，然后开始递归调度
+                this.scrollStep();
+                scheduleNextScroll();
+
+                console.log('滚动调度已重新启动');
+
+            } catch (error) {
+                console.error('重新启动滚动调度失败:', error);
+                this.stopAutoScroll();
+            }
+        },
+
         // 调试方法：获取当前状态信息（开发时使用）
         getDebugInfo() {
             return {
@@ -1227,6 +1290,51 @@
             } else {
                 this.startAutoScroll();
             }
+        },
+
+        // 暂停/恢复自动滚动（快捷键专用）
+        togglePause() {
+            if (!AppState.isTopicScrolling) {
+                // 如果未开始滚动，先开始滚动
+                this.startAutoScroll();
+                TabManager.showNotification('快捷键：开启自动滚动', 'info');
+            } else if (this.currentScrollState === this.ScrollState.PAUSED) {
+                // 如果已暂停，恢复滚动
+                this.transitionScrollState(this.ScrollState.SCROLLING, {
+                    reason: 'shortcut_resume',
+                    direction: 'down'
+                });
+                TabManager.showNotification('快捷键：恢复自动滚动', 'info');
+            } else if (this.currentScrollState === this.ScrollState.SCROLLING) {
+                // 如果正在滚动，暂停
+                this.transitionScrollState(this.ScrollState.PAUSED, {
+                    reason: 'shortcut_pause',
+                    direction: 'up'
+                });
+                TabManager.showNotification('快捷键：暂停自动滚动', 'info');
+            }
+        },
+
+        // 回到顶部（快捷键专用）
+        scrollToTop() {
+            window.scrollTo({
+                top: 0,
+                behavior: 'smooth'
+            });
+            TabManager.showNotification('快捷键：回到顶部', 'info');
+        },
+
+        // 滚动到底部（快捷键专用）
+        scrollToBottom() {
+            const scrollHeight = document.documentElement.scrollHeight;
+            const clientHeight = document.documentElement.clientHeight;
+            const targetY = scrollHeight - clientHeight;
+
+            window.scrollTo({
+                top: targetY,
+                behavior: 'smooth'
+            });
+            TabManager.showNotification('快捷键：滚动到底部', 'info');
         },
 
         // 检查是否应该自动开始滚动（根据配置）
@@ -1448,6 +1556,129 @@
         }
     };
 
+    // ==================== 快捷键管理器 ====================
+    const KeyboardManager = {
+        // 快捷键配置
+        shortcuts: {
+            'toggleScroll': {
+                key: 'e',
+                ctrl: true,
+                shift: true,
+                description: '开启/关闭自动滚动',
+                action: () => TopicScroller.toggleAutoScroll()
+            },
+            'pauseResume': {
+                key: 's',
+                ctrl: true,
+                shift: true,
+                description: '暂停/恢复自动滚动',
+                action: () => TopicScroller.togglePause()
+            },
+            'scrollToTop': {
+                key: 'r',
+                ctrl: true,
+                shift: true,
+                description: '回到顶部',
+                action: () => TopicScroller.scrollToTop()
+            },
+            'scrollToBottom': {
+                key: 'b',
+                ctrl: true,
+                shift: true,
+                description: '滚动到底部',
+                action: () => TopicScroller.scrollToBottom()
+            }
+        },
+
+        // 快捷键状态
+        isEnabled: true,
+        lastKeyTime: 0,
+        keyPressCount: 0,
+
+        // 初始化快捷键监听
+        init() {
+            document.addEventListener('keydown', (e) => this.handleKeyDown(e));
+            console.log('快捷键管理器已初始化');
+        },
+
+        // 处理按键事件
+        handleKeyDown(e) {
+            if (!this.isEnabled) return;
+
+            // 防止在输入框中触发快捷键
+            const activeElement = document.activeElement;
+            if (this.isInputElement(activeElement)) {
+                return;
+            }
+
+            // 检查是否匹配快捷键
+            for (const [name, config] of Object.entries(this.shortcuts)) {
+                if (this.matchesShortcut(e, config)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+
+                    // 防止快速重复触发
+                    const now = Date.now();
+                    if (now - this.lastKeyTime < 200) return;
+                    this.lastKeyTime = now;
+
+                    // 执行动作
+                    config.action();
+
+                    // 显示反馈
+                    this.showFeedback(config.description);
+                    return;
+                }
+            }
+        },
+
+        // 检查是否为输入元素
+        isInputElement(element) {
+            const inputTags = ['INPUT', 'TEXTAREA', 'SELECT'];
+            const inputTypes = ['text', 'password', 'email', 'search', 'url'];
+
+            return inputTags.includes(element.tagName) ||
+                   (element.tagName === 'INPUT' && inputTypes.includes(element.type)) ||
+                   element.contentEditable === 'true';
+        },
+
+        // 检查是否匹配快捷键
+        matchesShortcut(e, config) {
+            return e.key.toLowerCase() === config.key &&
+                   e.ctrlKey === !!config.ctrl &&
+                   e.shiftKey === !!config.shift &&
+                   e.altKey === !!config.alt &&
+                   e.metaKey === !!config.meta;
+        },
+
+        // 显示快捷键反馈
+        showFeedback(action) {
+            TabManager.showNotification(`快捷键：${action}`, 'info');
+        },
+
+        // 启用/禁用快捷键
+        setEnabled(enabled) {
+            this.isEnabled = enabled;
+            console.log(`快捷键已${enabled ? '启用' : '禁用'}`);
+        },
+
+        // 获取快捷键列表
+        getShortcutList() {
+            return Object.entries(this.shortcuts).map(([name, config]) => {
+                const keys = [];
+                if (config.ctrl) keys.push('Ctrl');
+                if (config.shift) keys.push('Shift');
+                if (config.alt) keys.push('Alt');
+                keys.push(config.key.toUpperCase());
+
+                return {
+                    keys: keys.join(' + '),
+                    description: config.description
+                };
+            });
+        }
+    };
+
     // ==================== UI控制面板（简化版） ====================
     const ControlPanel = {
         panel: null,
@@ -1550,6 +1781,16 @@
                             <div>📚 已打开：${AppState.openedArticles.size} 篇</div>
                             <div>🔄 滚动状态：已停止</div>
                             <div>👆 用户滚动：未检测</div>
+                        </div>
+
+                        <div class="linux-do-helper-form-group">
+                            <label class="linux-do-helper-label">⌨️ 快捷键：</label>
+                            <div style="font-size: 11px; color: #666; line-height: 1.6;">
+                                <div>• <strong>Ctrl+Shift+E</strong>：开启/关闭自动滚动</div>
+                                <div>• <strong>Ctrl+Shift+S</strong>：暂停/恢复自动滚动</div>
+                                <div>• <strong>Ctrl+Shift+R</strong>：回到顶部</div>
+                                <div>• <strong>Ctrl+Shift+B</strong>：滚动到底部</div>
+                            </div>
                         </div>
                     </div>
                 `;
@@ -2078,6 +2319,9 @@
     async function init() {
         try {
             ControlPanel.init();
+
+            // 初始化快捷键管理器
+            KeyboardManager.init();
 
             // 页面卸载时清理
             window.addEventListener('beforeunload', () => {
