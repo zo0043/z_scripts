@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Linux.do 文章助手 (简化版)
 // @namespace    http://tampermonkey.net/
-// @version      2.4.0
-// @description  简化版Linux.do文章助手 - 关键词匹配、批量打开功能和带智能底部检测的帖子页面自动滚动
+// @version      2.6.0
+// @description  简化版Linux.do文章助手 - 关键词匹配、批量打开功能和即时响应的帖子页面自动滚动
 // @author       AI Assistant
 // @match        https://linux.do/*
 // @grant        GM_openInTab
@@ -175,6 +175,14 @@
             opacity: 0;
             transform: translateX(100%);
             transition: all 0.3s ease;
+        }
+
+        .linux-do-helper-notification.scroll-pause {
+            background: #FF9800;
+        }
+
+        .linux-do-helper-notification.scroll-resume {
+            background: #4CAF50;
         }
     `);
 
@@ -351,6 +359,15 @@
 
     // ==================== 帖子滚动管理器 ====================
     const TopicScroller = {
+        // 用户滚动行为检测相关变量
+        lastScrollTop: 0,
+        isPausedByUser: false,
+        userScrollBound: false,
+
+        // 防抖相关变量
+        scrollDebounceTimer: null,
+        statusUpdateTimer: null,
+
         // 计算随机滚动间隔 (100ms - 1000ms)
         getRandomDelay() {
             // 固定随机范围：100ms - 1000ms
@@ -365,6 +382,9 @@
 
             const config = AppState.config;
             AppState.isTopicScrolling = true;
+
+            // 添加用户滚动事件监听
+            this.bindUserScrollEvents();
 
             // 使用递归setTimeout实现随机间隔滚动
             const scheduleNextScroll = () => {
@@ -392,10 +412,30 @@
 
             AppState.isTopicScrolling = false;
 
+            // 清理定时器
             if (AppState.topicScrollTimer) {
                 clearTimeout(AppState.topicScrollTimer);
                 AppState.topicScrollTimer = null;
             }
+
+            // 移除用户滚动事件监听
+            this.unbindUserScrollEvents();
+
+            // 清理防抖定时器
+            if (this.scrollDebounceTimer) {
+                clearTimeout(this.scrollDebounceTimer);
+                this.scrollDebounceTimer = null;
+            }
+
+            // 清理状态更新定时器
+            if (this.statusUpdateTimer) {
+                clearTimeout(this.statusUpdateTimer);
+                this.statusUpdateTimer = null;
+            }
+
+            // 重置用户滚动状态
+            this.isPausedByUser = false;
+            this.lastScrollTop = 0;
 
             TabManager.showNotification('帖子自动滚动已停止');
         },
@@ -403,6 +443,11 @@
         // 滚动一步
         scrollStep() {
             const config = AppState.config;
+
+            // 检查用户是否暂停了滚动 - 如果暂停，直接返回，不继续调度
+            if (this.isPausedByUser) {
+                return; // 简化：暂停时直接返回，由外部事件触发恢复
+            }
 
             // 更精确的底部检测
             const isAtBottom = this.isAtBottom();
@@ -426,12 +471,8 @@
                     behavior: 'smooth'
                 });
 
-                // 更新状态显示（显示下次滚动的延迟时间）
-                if (typeof ControlPanel !== 'undefined' && ControlPanel.updateTopicScrollStatus) {
-                    setTimeout(() => {
-                        ControlPanel.updateTopicScrollStatus();
-                    }, 100);
-                }
+                // 节流更新状态显示
+                this.updateTopicScrollStatusThrottled();
             }
         },
 
@@ -454,7 +495,7 @@
             // 计算距离底部的距离
             const distanceFromBottom = scrollHeight - (scrollTop + clientHeight);
 
-            // 多重检测条件
+            // 简化的检测条件（移除冗余的动态内容检测）
             const isNearBottom = distanceFromBottom <= 150; // 150px容差
             const hasScrolledEnough = scrollTop > 300; // 至少滚动过300px
             const isPageLongEnough = scrollHeight > clientHeight * 1.5; // 页面至少是视窗高度的1.5倍
@@ -462,33 +503,8 @@
             // 检查是否有加载更多内容的指示器
             const hasLoadingIndicator = this.checkForLoadingIndicator();
 
-            // 检查最近是否有内容变化（处理动态加载）
-            const hasRecentContentChange = this.checkForRecentContentChange();
-
-            // 综合判断是否到达底部
-            const reallyAtBottom = isNearBottom &&
-                                 hasScrolledEnough &&
-                                 isPageLongEnough &&
-                                 !hasLoadingIndicator &&
-                                 !hasRecentContentChange;
-
-            // 调试信息（仅在开发时启用）
-            if (window.location.hostname === 'localhost' || window.location.search.includes('debug=true')) {
-                console.log('Linux.do助手底部检测:', {
-                    scrollHeight,
-                    clientHeight,
-                    scrollTop,
-                    distanceFromBottom,
-                    isNearBottom,
-                    hasScrolledEnough,
-                    isPageLongEnough,
-                    hasLoadingIndicator,
-                    hasRecentContentChange,
-                    reallyAtBottom
-                });
-            }
-
-            return reallyAtBottom;
+            // 综合判断是否到达底部（简化逻辑）
+            return isNearBottom && hasScrolledEnough && isPageLongEnough && !hasLoadingIndicator;
         },
 
         // 检查是否有加载指示器
@@ -509,23 +525,123 @@
             });
         },
 
-        // 检查最近是否有内容变化（简单的实现）
-        checkForRecentContentChange() {
-            // 记录上次的scrollHeight
-            if (!this.lastScrollHeight) {
-                this.lastScrollHeight = document.documentElement.scrollHeight;
-                return false;
+        // 绑定用户滚动事件监听
+        bindUserScrollEvents() {
+            // 避免重复绑定（双重检查）
+            if (this.userScrollBound) return;
+
+            // 清理可能存在的旧绑定
+            this.unbindUserScrollEvents();
+
+            // 初始化当前滚动位置
+            this.lastScrollTop = window.pageYOffset || document.documentElement.scrollTop;
+
+            try {
+                // 绑定滚动事件
+                this.handleUserScroll = (e) => this.onUserScroll(e);
+                window.addEventListener('scroll', this.handleUserScroll, { passive: true });
+
+                // 绑定鼠标滚轮事件（更精确的检测）
+                this.handleWheel = (e) => this.onUserWheel(e);
+                window.addEventListener('wheel', this.handleWheel, { passive: true });
+
+                this.userScrollBound = true;
+            } catch (error) {
+                console.error('Linux.do助手: 滚动事件绑定失败', error);
+                this.userScrollBound = false;
+            }
+        },
+
+        // 移除用户滚动事件监听
+        unbindUserScrollEvents() {
+            if (!this.userScrollBound) return;
+
+            try {
+                // 安全移除事件监听器
+                if (this.handleUserScroll) {
+                    window.removeEventListener('scroll', this.handleUserScroll);
+                    this.handleUserScroll = null;
+                }
+
+                if (this.handleWheel) {
+                    window.removeEventListener('wheel', this.handleWheel);
+                    this.handleWheel = null;
+                }
+
+                this.userScrollBound = false;
+            } catch (error) {
+                console.error('Linux.do助手: 滚动事件解绑失败', error);
+            }
+        },
+
+        // 统一的滚动方向处理逻辑（带防抖）
+        handleScrollDirection(scrollDirection) {
+            let stateChanged = false;
+            let notificationMessage = '';
+            let notificationType = 'default';
+
+            if (scrollDirection === 'up' && !this.isPausedByUser) {
+                this.isPausedByUser = true;
+                stateChanged = true;
+                notificationMessage = '向上滚动，自动滚动已暂停';
+                notificationType = 'pause';
+            } else if (scrollDirection === 'down' && this.isPausedByUser) {
+                this.isPausedByUser = false;
+                stateChanged = true;
+                notificationMessage = '向下滚动，自动滚动已恢复';
+                notificationType = 'resume';
+
+                // 恢复滚动时，立即触发一次滚动检查
+                setTimeout(() => {
+                    if (AppState.isTopicScrolling && !this.isPausedByUser) {
+                        this.scrollStep();
+                    }
+                }, 100);
             }
 
-            const currentScrollHeight = document.documentElement.scrollHeight;
-            const heightChanged = Math.abs(currentScrollHeight - this.lastScrollHeight) > 100;
-
-            if (heightChanged) {
-                this.lastScrollHeight = currentScrollHeight;
-                return true;
+            // 显示通知（仅在状态改变时）
+            if (stateChanged) {
+                TabManager.showNotification(notificationMessage, notificationType);
             }
 
-            return false;
+            // 节流更新UI状态显示
+            this.updateTopicScrollStatusThrottled();
+        },
+
+        // 处理用户滚动事件（带防抖）
+        onUserScroll(e) {
+            // 防抖处理
+            if (this.scrollDebounceTimer) {
+                clearTimeout(this.scrollDebounceTimer);
+            }
+
+            this.scrollDebounceTimer = setTimeout(() => {
+                const currentScrollTop = window.pageYOffset || document.documentElement.scrollTop;
+                const scrollDirection = currentScrollTop > this.lastScrollTop ? 'down' : 'up';
+
+                this.handleScrollDirection(scrollDirection);
+
+                // 更新上次滚动位置
+                this.lastScrollTop = currentScrollTop;
+            }, 50); // 50ms防抖
+        },
+
+        // 处理用户鼠标滚轮事件（直接处理，无防抖）
+        onUserWheel(e) {
+            const wheelDirection = e.deltaY > 0 ? 'down' : 'up';
+            this.handleScrollDirection(wheelDirection);
+        },
+
+        // 节流的状态更新方法
+        updateTopicScrollStatusThrottled() {
+            if (this.statusUpdateTimer) return;
+
+            this.statusUpdateTimer = setTimeout(() => {
+                if (typeof ControlPanel !== 'undefined' && ControlPanel.updateTopicScrollStatus) {
+                    ControlPanel.updateTopicScrollStatus();
+                }
+                this.statusUpdateTimer = null;
+            }, 100);
         },
 
         // 切换滚动状态
@@ -720,11 +836,19 @@
             return results;
         },
 
-        showNotification(message) {
+        showNotification(message, type = 'default') {
             if (!AppState.config.enableNotification) return;
 
             const notification = document.createElement('div');
             notification.className = 'linux-do-helper-notification';
+
+            // 根据类型添加样式
+            if (type === 'pause') {
+                notification.classList.add('scroll-pause');
+            } else if (type === 'resume') {
+                notification.classList.add('scroll-resume');
+            }
+
             notification.textContent = message;
 
             document.body.appendChild(notification);
@@ -813,6 +937,9 @@
                             <div style="font-size: 11px; color: #888; margin-top: 2px;">
                                 📏 滚动距离控制每次向下滚动多少像素
                             </div>
+                            <div style="font-size: 11px; color: #888; margin-top: 2px;">
+                                🎯 向上滚动暂停，向下滚动恢复
+                            </div>
                         </div>
 
                         <div class="linux-do-helper-form-group">
@@ -846,6 +973,7 @@
                             <div>🪟 窗口：${AppState.windowCount}/${AppState.config.maxTabs}</div>
                             <div>📚 已打开：${AppState.openedArticles.size} 篇</div>
                             <div>🔄 滚动状态：已停止</div>
+                            <div>👆 用户滚动：未检测</div>
                         </div>
                     </div>
                 `;
@@ -1133,25 +1261,19 @@
             if (!statusDiv) return;
 
             // 更新滚动状态显示
-            const scrollStatusText = AppState.isTopicScrolling ? '滚动中' : '已停止';
-            const nextDelay = AppState.isTopicScrolling ? TopicScroller.getRandomDelay() : 0;
-            const delayText = AppState.isTopicScrolling ? ` (下次: ${nextDelay}ms)` : '';
+            const scrollStatusText = AppState.isTopicScrolling ?
+                (TopicScroller.isPausedByUser ? '已暂停' : '滚动中') : '已停止';
 
             const scrollStatusDiv = statusDiv.querySelector('div:nth-child(5)');
             if (scrollStatusDiv) {
-                scrollStatusDiv.textContent = `🔄 滚动状态：${scrollStatusText}${delayText}`;
+                scrollStatusDiv.textContent = `🔄 滚动状态：${scrollStatusText}`;
             }
 
-            // 更新随机数信息显示
-            const existingRandomDiv = statusDiv.querySelector('div:nth-child(6)');
-            if (!existingRandomDiv && AppState.isTopicScrolling) {
-                const randomDiv = document.createElement('div');
-                randomDiv.textContent = '🎲 随机间隔: 100ms-1000ms';
-                randomDiv.style.fontSize = '11px';
-                randomDiv.style.color = '#666';
-                statusDiv.appendChild(randomDiv);
-            } else if (existingRandomDiv) {
-                existingRandomDiv.textContent = AppState.isTopicScrolling ? '🎲 随机间隔: 100ms-1000ms' : '';
+            // 更新用户滚动状态显示
+            const userScrollStatusDiv = statusDiv.querySelector('div:nth-child(6)');
+            if (userScrollStatusDiv) {
+                const pauseStatus = TopicScroller.isPausedByUser ? '用户暂停⏸️' : '未检测';
+                userScrollStatusDiv.textContent = `👆 用户滚动：${pauseStatus}`;
             }
         },
 
