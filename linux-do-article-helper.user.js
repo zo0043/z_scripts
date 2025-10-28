@@ -2,7 +2,7 @@
 // @name         Linux.do 文章助手
 // @namespace    http://tampermonkey.net/
 // @version      1.4.0
-// @description  自动获取Linux.do文章列表，根据关键词匹配并打开文章，支持配置界面和滚动控制
+// @description  自动获取Linux.do文章列表，根据关键词匹配并依次打开文章，支持配置界面和滚动控制
 // @author       AI Assistant
 // @match        https://linux.do/latest
 // @match        https://linux.do/*
@@ -612,7 +612,7 @@
         },
 
         // 依次打开多个标签页
-        async openMultipleTabs(urls, delay = 2000, topics = null, source = 'manual') {
+        async openMultipleTabs(urls, delay = 3000, topics = null, source = 'manual') {
             const results = [];
             for (let i = 0; i < urls.length; i++) {
                 try {
@@ -620,7 +620,7 @@
                     const tabId = await this.openTab(urls[i], i === 0, false, topic, source);
                     results.push({ url: urls[i], success: true, tabId });
 
-                    // 依次打开，使用固定延迟时间
+                    // 依次打开，使用更长延迟时间避免浏览器阻止
                     if (i < urls.length - 1) {
                         await new Promise(resolve => setTimeout(resolve, delay));
                     }
@@ -1249,7 +1249,7 @@
                 this.updateStatus(`正在打开 ${matchedTopics.length} 篇文章...`);
 
                 const urls = matchedTopics.map(topic => topic.url);
-                const results = await TabManager.openMultipleTabs(urls, 1000, matchedTopics, 'manual');
+                const results = await TabManager.openMultipleTabs(urls, 3000, matchedTopics, 'manual');
 
                 const successCount = results.filter(r => r.success).length;
                 const failCount = results.length - successCount;
